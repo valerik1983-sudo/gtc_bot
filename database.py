@@ -1,17 +1,11 @@
-# ✅ ПРАВИЛЬНО:
 import os
 import sqlite3
 import asyncio
-
-DB_NAME = os.getenv('DB_PATH', 'crm.db')
-
+from config import DATABASE_PATH
 
 def get_connection():
-
-    conn = sqlite3.connect(DB_NAME)
-
+    conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
-
     return conn
 
 
@@ -167,6 +161,14 @@ def init_db():
         cursor.execute("ALTER TABLE products ADD COLUMN symptoms_text TEXT")
     except:
         pass
+    try:
+        cursor.execute("ALTER TABLE products ADD COLUMN video_url TEXT")
+        print("✅ Добавлена колонка video_url")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e):
+            print("ℹ️ Колонка video_url уже существует")
+        else:
+            raise
 
     #Заказы
     # Корзина
@@ -317,7 +319,89 @@ def init_db():
             print("ℹ️ Колонка sort_order уже существует")
         else:
             raise
+    
+        # ===== МИГРАЦИИ (добавление новых колонок) =====
+    try:
+        cursor.execute("ALTER TABLE temp_refs ADD COLUMN source TEXT DEFAULT 'direct'")
+        print("✅ Добавлена колонка source в temp_refs")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e):
+            print("ℹ️ Колонка source уже существует в temp_refs")
+        else:
+            raise
 
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN referral_source TEXT")
+        print("✅ Добавлена колонка referral_source в users")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e):
+            print("ℹ️ Колонка referral_source уже существует в users")
+        else:
+            raise
+
+    try:
+        cursor.execute("ALTER TABLE users ADD COLUMN diagnostic_gift_claimed INTEGER DEFAULT 0")
+        print("✅ Добавлена колонка diagnostic_gift_claimed в users")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" in str(e):
+            print("ℹ️ Колонка diagnostic_gift_claimed уже существует в users")
+        else:
+            raise
+    
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS gift_claims (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,  -- telegram_id
+        diagnostic_id INTEGER,      -- id из diagnostic_results (может быть NULL)
+        redeemed INTEGER DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        redeemed_at TIMESTAMP
+    )
+    """)
+
+        # ===== Память и профили =====
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            role TEXT NOT NULL,  -- 'user' или 'assistant'
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS user_profiles (
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            age INTEGER,
+            city TEXT,
+            health_goals TEXT,
+            business_goals TEXT,
+            main_interests TEXT,  -- JSON
+            health_issues TEXT,   -- JSON
+            funnel_stage TEXT,
+            last_intent TEXT,
+            suggested_next_step TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ai_analytics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            query TEXT NOT NULL,
+            response TEXT,
+            intent TEXT,
+            product_mentioned TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    init_diagnostics_table() 
+    init_promotions_table()
+    
     conn.commit()
     conn.close()
 
@@ -335,11 +419,11 @@ def add_user(
     city,    
     gender,
     sponsor_id=None,
-    role="lead"  # 👈 ДОБАВЬТЕ
+    role="lead",
+    referral_source=None  # 👈 новый параметр
 ):
     conn = get_connection()
     cursor = conn.cursor()
-
     cursor.execute("""
     INSERT INTO users
     (
@@ -351,9 +435,10 @@ def add_user(
         city,
         gender,
         sponsor_id,
-        role
+        role,
+        referral_source
     )
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         telegram_id,
         username,
@@ -363,9 +448,9 @@ def add_user(
         city,
         gender,
         sponsor_id,
-        role
+        role,
+        referral_source
     ))
-
     conn.commit()
     conn.close()
 
@@ -2341,27 +2426,50 @@ def update_consult_request_status(consult_id, status):
     conn.close()    
 
 def get_full_referral_tree(sponsor_id, level=0, max_level=5):
-    """Рекурсивно получает дерево рефералов"""
+    """Рекурсивно получает дерево рефералов, включая незарегистрированных из temp_refs,
+       и добавляет флаг has_diagnostic для каждого пользователя."""
     conn = get_connection()
     cursor = conn.cursor()
     
+    # 1. Получаем зарегистрированных пользователей (у кого sponsor_id = sponsor_id)
     cursor.execute("""
         SELECT telegram_id, fio, phone, status, created_at
         FROM users 
         WHERE sponsor_id = ?
         ORDER BY created_at DESC
     """, (sponsor_id,))
-    
     referrals = cursor.fetchall()
+    
+    # 2. Получаем НЕзарегистрированных из temp_refs
+    cursor.execute("""
+        SELECT tr.telegram_id, tr.created_at
+        FROM temp_refs tr
+        LEFT JOIN users u ON tr.telegram_id = u.telegram_id
+        WHERE tr.sponsor_id = ?
+        AND u.telegram_id IS NULL
+        ORDER BY tr.created_at DESC
+    """, (sponsor_id,))
+    unregistered = cursor.fetchall()
     conn.close()
     
     tree = []
+    
+    # Обрабатываем зарегистрированных
     for ref in referrals:
+        # Проверяем, проходил ли диагностику
+        conn2 = get_connection()
+        cursor2 = conn2.cursor()
+        cursor2.execute("SELECT COUNT(*) FROM diagnostic_results WHERE user_id = ?", (ref["telegram_id"],))
+        has_diag = cursor2.fetchone()[0] > 0
+        conn2.close()
+        
         node = {
             "id": ref["telegram_id"],
             "fio": ref["fio"],
             "phone": ref["phone"],
             "status": ref["status"],
+            "registered": True,
+            "has_diagnostic": has_diag,
             "level": level,
             "children": []
         }
@@ -2369,13 +2477,32 @@ def get_full_referral_tree(sponsor_id, level=0, max_level=5):
             node["children"] = get_full_referral_tree(ref["telegram_id"], level + 1, max_level)
         tree.append(node)
     
+    # Обрабатываем незарегистрированных
+    for ref in unregistered:
+        # Проверяем диагностику даже для незарегистрированных
+        conn2 = get_connection()
+        cursor2 = conn2.cursor()
+        cursor2.execute("SELECT COUNT(*) FROM diagnostic_results WHERE user_id = ?", (ref["telegram_id"],))
+        has_diag = cursor2.fetchone()[0] > 0
+        conn2.close()
+        
+        node = {
+            "id": ref["telegram_id"],
+            "fio": "❌ Не зарегистрирован",
+            "phone": None,
+            "status": "unregistered",
+            "registered": False,
+            "has_diagnostic": has_diag,  # незарегистрированный тоже может пройти диагностику
+            "level": level,
+            "children": []
+        }
+        tree.append(node)
+    
     return tree
-
-
 # В database.py, найдите и замените функцию format_referral_tree
 
 def format_referral_tree(tree, prefix="", is_last=True):
-    """Форматирует дерево рефералов в текст с цветовым кодированием"""
+    """Форматирует дерево рефералов в текст с цветовым кодированием и значком диагностики"""
     text = ""
     for i, node in enumerate(tree):
         is_last_child = (i == len(tree) - 1)
@@ -2392,16 +2519,19 @@ def format_referral_tree(tree, prefix="", is_last=True):
             else:
                 text += "├── "
         
+        # Добавляем значок диагностики (если есть)
+        diag_icon = "🧬 " if node.get('has_diagnostic') else ""
+        
         # Проверяем, зарегистрирован ли пользователь
         if not node.get("registered", True):
             # Незарегистрированный пользователь
-            text += f"⏳ **{node['fio']}**\n"
+            text += f"{diag_icon}⏳ **{node['fio']}**\n"
             text += prefix + ("    " if is_last_child else "│   ") + f"   🆔 {node['id']}\n"
             text += prefix + ("    " if is_last_child else "│   ") + "   ⚠️ *Ожидает регистрации*\n"
         else:
             # Зарегистрированный пользователь
             style = get_status_style(node["status"])
-            text += f"{style['emoji']} **{node['fio']}**\n"
+            text += f"{diag_icon}{style['emoji']} **{node['fio']}**\n"
             text += prefix + ("    " if is_last_child else "│   ") + f"   🆔 {node['id']}\n"
             
             if node.get("phone"):
@@ -2413,7 +2543,6 @@ def format_referral_tree(tree, prefix="", is_last=True):
             text += format_referral_tree(node["children"], new_prefix, is_last_child)
     
     return text
-
 
 def get_status_style(status):
     """Возвращает цвет и эмодзи для статуса"""
@@ -2429,19 +2558,17 @@ def get_status_style(status):
 
 # ==================== ВРЕМЕННЫЕ РЕФЕРАЛЬНЫЕ СВЯЗИ ====================
 
-def save_temp_sponsor(telegram_id: int, sponsor_id: int):
-    """Сохраняет временную реферальную связь"""
+def save_temp_sponsor(telegram_id: int, sponsor_id: int, source: str = 'direct'):
+    """Сохраняет временную реферальную связь с указанием источника"""
     conn = get_connection()
     cursor = conn.cursor()
-    
     cursor.execute("""
-        INSERT OR REPLACE INTO temp_refs (telegram_id, sponsor_id)
-        VALUES (?, ?)
-    """, (telegram_id, sponsor_id))
-    
+        INSERT OR REPLACE INTO temp_refs (telegram_id, sponsor_id, source)
+        VALUES (?, ?, ?)
+    """, (telegram_id, sponsor_id, source))
     conn.commit()
     conn.close()
-    print(f"🔵🔵🔵 СОХРАНЁН ВРЕМЕННЫЙ СПОНСОР: {telegram_id} -> {sponsor_id}")
+    print(f"🔵🔵🔵 СОХРАНЁН ВРЕМЕННЫЙ СПОНСОР: {telegram_id} -> {sponsor_id} (источник: {source})")
 
 
 def get_temp_sponsor(telegram_id: int):
@@ -2488,6 +2615,67 @@ def get_temp_refs_count(sponsor_id: int):
     conn.close()
     return count
 
+def get_temp_source(telegram_id: int):
+    """Получает источник перехода из temp_refs, если есть"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT source FROM temp_refs WHERE telegram_id = ?", (telegram_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return row['source'] if row else 'direct'
+
+def get_user_link_stats(telegram_id: int):
+    """Статистика переходов по ссылкам пользователя (источники + регистрации)"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT source, COUNT(*) as total,
+               SUM(CASE WHEN u.telegram_id IS NOT NULL THEN 1 ELSE 0 END) as registered
+        FROM temp_refs tr
+        LEFT JOIN users u ON tr.telegram_id = u.telegram_id
+        WHERE tr.sponsor_id = ?
+        GROUP BY source
+        ORDER BY total DESC
+    """, (telegram_id,))
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_admin_link_stats():
+    """Сводка по всем наставникам: количество переходов и регистраций, разбивка по источникам"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT tr.sponsor_id, u.fio,
+               COUNT(*) as total,
+               SUM(CASE WHEN u2.telegram_id IS NOT NULL THEN 1 ELSE 0 END) as registered
+        FROM temp_refs tr
+        LEFT JOIN users u ON tr.sponsor_id = u.telegram_id
+        LEFT JOIN users u2 ON tr.telegram_id = u2.telegram_id
+        GROUP BY tr.sponsor_id
+        ORDER BY total DESC
+    """)
+    rows = cursor.fetchall()
+    result = []
+    for row in rows:
+        sponsor_id = row['sponsor_id']
+        # Получаем разбивку по источникам для этого спонсора
+        cursor.execute("""
+            SELECT source, COUNT(*) as count
+            FROM temp_refs
+            WHERE sponsor_id = ?
+            GROUP BY source
+        """, (sponsor_id,))
+        sources = cursor.fetchall()
+        result.append({
+            'sponsor_id': sponsor_id,
+            'fio': row['fio'] or f"ID {sponsor_id}",
+            'total': row['total'],
+            'registered': row['registered'],
+            'sources': [dict(s) for s in sources]
+        })
+    conn.close()
+    return result
 
 def get_temp_refs_users(sponsor_id: int):
     """Получить список пользователей, перешедших по ссылке (из temp_refs)"""
@@ -2724,3 +2912,281 @@ def get_all_products_from_db():
     products = cursor.fetchall()
     conn.close()
     return [dict(p) for p in products] 
+
+# database.py - добавить в конец файла
+
+# ==================== ДИАГНОСТИКА ====================
+
+def init_diagnostics_table():
+    """Создание таблицы для результатов диагностики"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS diagnostic_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            user_fio TEXT,
+            total_score INTEGER NOT NULL,
+            result_key TEXT NOT NULL,
+            answers TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+
+def save_diagnostic_result(user_id, user_fio, total_score, result_key, answers):
+    """Сохранить результат диагностики"""
+    import json
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    answers_json = json.dumps(answers, ensure_ascii=False)
+    
+    cursor.execute("""
+        INSERT INTO diagnostic_results (user_id, user_fio, total_score, result_key, answers)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, user_fio, total_score, result_key, answers_json))
+    
+    conn.commit()
+    conn.close()
+
+
+def get_diagnostic_history(user_id, limit=10):
+    """Получить историю диагностики пользователя"""
+    import json
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT * FROM diagnostic_results
+        WHERE user_id = ?
+        ORDER BY created_at DESC
+        LIMIT ?
+    """, (user_id, limit))
+    
+    rows = cursor.fetchall()
+    conn.close()
+    
+    result = []
+    for row in rows:
+        item = dict(row)
+        # Парсим answers из JSON
+        if item.get('answers'):
+            try:
+                item['answers'] = json.loads(item['answers'])
+            except:
+                item['answers'] = {}
+        result.append(item)
+    
+    return result
+
+
+def get_best_diagnostic_result(user_id):
+    """Получить лучший результат диагностики пользователя"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        SELECT * FROM diagnostic_results
+        WHERE user_id = ?
+        ORDER BY total_score DESC
+        LIMIT 1
+    """, (user_id,))
+    
+    row = cursor.fetchone()
+    conn.close()
+    
+    return dict(row) if row else None
+
+def get_users_with_diagnostic_status(user_ids):
+    """Принимает список telegram_id, возвращает словарь {telegram_id: True/False}"""
+    if not user_ids:
+        return {}
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholders = ','.join('?' for _ in user_ids)
+    cursor.execute(f"""
+        SELECT user_id, COUNT(*) as cnt
+        FROM diagnostic_results
+        WHERE user_id IN ({placeholders})
+        GROUP BY user_id
+    """, user_ids)
+    rows = cursor.fetchall()
+    conn.close()
+    result = {row['user_id']: row['cnt'] > 0 for row in rows}
+    # Для всех переданных, которых нет в результате, ставим False
+    for uid in user_ids:
+        if uid not in result:
+            result[uid] = False
+    return result
+
+# ==================== АКЦИИ И ПОДАРКИ ====================
+
+def init_promotions_table():
+    """Создание таблицы для акций и подарков"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS promotions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            description TEXT NOT NULL,
+            photo_id TEXT,
+            link TEXT,
+            is_active INTEGER DEFAULT 1,
+            sort_order INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            expires_at TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def get_all_promotions(active_only=False):
+    """Получить все акции (или только активные)"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    query = "SELECT * FROM promotions"
+    if active_only:
+        query += " WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)"
+    query += " ORDER BY sort_order ASC, created_at DESC"
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+def get_promotion_by_id(promo_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM promotions WHERE id = ?", (promo_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def add_promotion(title, description, photo_id=None, link=None, expires_at=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO promotions (title, description, photo_id, link, expires_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (title, description, photo_id, link, expires_at))
+    conn.commit()
+    promo_id = cursor.lastrowid
+    conn.close()
+    return promo_id
+
+def update_promotion(promo_id, **kwargs):
+    conn = get_connection()
+    cursor = conn.cursor()
+    allowed_fields = ['title', 'description', 'photo_id', 'link', 'is_active', 'sort_order', 'expires_at']
+    for key, value in kwargs.items():
+        if key in allowed_fields and value is not None:
+            cursor.execute(f"UPDATE promotions SET {key} = ? WHERE id = ?", (value, promo_id))
+    conn.commit()
+    conn.close()
+
+def delete_promotion(promo_id):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM promotions WHERE id = ?", (promo_id,))
+    conn.commit()
+    conn.close()
+    
+def has_active_promotions():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM promotions WHERE is_active = 1 AND (expires_at IS NULL OR expires_at > CURRENT_TIMESTAMP)")
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0    
+
+def create_gift_claim(user_id, diagnostic_id=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO gift_claims (user_id, diagnostic_id) VALUES (?, ?)", (user_id, diagnostic_id))
+    conn.commit()
+    conn.close()
+
+def get_gift_claim(user_id):
+    """Получить неиспользованный подарок для пользователя"""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM gift_claims WHERE user_id = ? AND redeemed = 0 ORDER BY created_at DESC LIMIT 1", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+def redeem_gift_claim(claim_id, order_id=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE gift_claims SET redeemed = 1, redeemed_at = CURRENT_TIMESTAMP WHERE id = ?", (claim_id,))
+    conn.commit()
+    conn.close()
+    
+def get_temp_refs_full():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT tr.telegram_id, tr.sponsor_id, tr.source, tr.created_at,
+               CASE WHEN u.telegram_id IS NOT NULL THEN 1 ELSE 0 END as registered,
+               u.fio as user_fio,
+               s.fio as sponsor_fio
+        FROM temp_refs tr
+        LEFT JOIN users u ON tr.telegram_id = u.telegram_id
+        LEFT JOIN users s ON tr.sponsor_id = s.telegram_id
+        ORDER BY tr.created_at DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return [dict(row) for row in rows]    
+
+def save_ai_analytics(user_id, query, response=None, intent=None, product_mentioned=None):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO ai_analytics (user_id, query, response, intent, product_mentioned)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, query, response, intent, product_mentioned))
+    conn.commit()
+    conn.close()  
+
+def create_consult_request(user_id, sponsor_id=None, topic="Консультация от AI"):
+    import sqlite3
+    conn = sqlite3.connect("consultations.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO consult_requests (user_id, sponsor_id, status, topic)
+        VALUES (?, ?, 'active', ?)
+    """, (user_id, sponsor_id, topic))
+    consult_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return consult_id      
+
+def create_consultation_request(user_id, question, sponsor_id=None):
+    """Создаёт заявку на консультацию в таблице consult_requests (consultations.db)."""
+    import sqlite3
+    conn = sqlite3.connect("consultations.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS consult_requests (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            sponsor_id INTEGER,
+            question TEXT,
+            status TEXT DEFAULT 'new',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        INSERT INTO consult_requests (user_id, sponsor_id, question)
+        VALUES (?, ?, ?)
+    """, (user_id, sponsor_id, question))
+    conn.commit()
+    conn.close()    

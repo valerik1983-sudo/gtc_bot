@@ -4,6 +4,8 @@ import os
 from logger import logger
 from dotenv import load_dotenv
 
+
+
 logger.info("Бот запущен")
 
 from handlers.menu import router as menu_router
@@ -16,20 +18,24 @@ from handlers.admin_products import router as admin_products_router
 from handlers.orders import router as orders_router
 from handlers.cart import router as cart_router
 from handlers.cities_admin import router as cities_admin_router
+from handlers.diagnostics import router as diagnostics_router
+from handlers.registration import router as registration_router
+
+
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from handlers.income import router as income_router
 
 from aiogram.types import FSInputFile
 from aiogram import Bot, Dispatcher
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 
 from keyboards import get_main_menu
 from inline_keyboards import sponsor_keyboard
-from states import Registration, Consultation, MentorMessage, ClientReply
+from states import Registration, Consultation, MentorMessage, ClientReply, CustomSource
 from inline_keyboards import reply_to_mentor_keyboard, people_keyboard, person_card_keyboard
 from keyboards import my_people_keyboard, consultations_menu_keyboard
 from database import get_user_by_id, update_user_status, update_last_contact, get_events, is_admin, get_admins, add_event, get_connection, get_my_people, get_my_people_count, get_people_count_by_status, get_funnel_stats
@@ -41,11 +47,15 @@ from database import (
     get_my_people_count, get_people_count_by_status, get_user_by_telegram_id,
     get_funnel_stats, get_referrals_count, get_referrals, get_users_need_attention,
     get_consultation_stats, get_consultations_by_status,
-    get_temp_refs_count, get_temp_refs_users
+    get_temp_refs_count, get_temp_refs_users,
+    save_temp_sponsor,   # 👈 добавить
+    clear_temp_sponsor,
+    get_temp_sponsor
 )
 
-from config import ADMIN_ID  # 👈 ДОБАВЛЯЕМ
+from config import ADMIN_ID, MAIN_BOT_USERNAME # 👈 ДОБАВЛЯЕМ
 from handlers.quiz import router as quiz_router
+
 from handlers.invite_generator import router as invite_generator_router
 
 
@@ -54,10 +64,12 @@ load_dotenv()  # Загружаем .env
 TOKEN = os.getenv('MAIN_BOT_TOKEN')
 if not TOKEN:
     raise ValueError("MAIN_BOT_TOKEN не найден в .env файле!")
+bot = Bot(token=TOKEN)    
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 # ==================== ПОДКЛЮЧЕНИЕ РОУТЕРОВ ====================
+
 
 dp.include_router(menu_router)
 dp.include_router(products_router)
@@ -72,6 +84,11 @@ dp.include_router(complaints_router)
 dp.include_router(admin_products_router)
 dp.include_router(quiz_router)
 dp.include_router(invite_generator_router)
+dp.include_router(diagnostics_router) 
+dp.include_router(registration_router)
+
+
+
 
 
 
@@ -80,20 +97,36 @@ dp.include_router(invite_generator_router)
 @dp.message(Command("start"))
 async def start_command(message: Message, state: FSMContext):
     args = message.text.split()
-    sponsor_id = None
-    
+       
     if len(args) > 1:
-        try:
-            sponsor_id = int(args[1])
-            print(f"🔵🔵🔵 ПОЛУЧЕН SPONSOR_ID ИЗ ССЫЛКИ: {sponsor_id}")
-            
-            # 👇 СОХРАНЯЕМ ВРЕМЕННОГО СПОНСОРА В БД
-            from database import save_temp_sponsor
-            save_temp_sponsor(message.from_user.id, sponsor_id)
-            
+        param = args[1]
+        sponsor_id = None
+        source = None
+
+        # Проверяем, не число ли это (старый формат)
+        if param.isdigit():
+            sponsor_id = int(param)
+            source = 'direct'
+        else:
+            # Парсим параметры вида sponsor_123_source_flyer
+            parts = param.split('_')
+            for i, part in enumerate(parts):
+                if part == 'sponsor' and i+1 < len(parts):
+                    try:
+                        sponsor_id = int(parts[i+1])
+                    except:
+                        pass
+                elif part == 'source' and i+1 < len(parts):
+                    source = parts[i+1]
+            if not source:
+                source = 'direct'
+
+        if sponsor_id:
+            print(f"🔵🔵🔵 ПОЛУЧЕН СПОНСОР: {sponsor_id}, ИСТОЧНИК: {source}")
+            save_temp_sponsor(message.from_user.id, sponsor_id, source)
             await state.update_data(sponsor_id=sponsor_id)
-        except ValueError:
-            print(f"❌ Ошибка: {args[1]}")
+        else:
+            print(f"❌ Ошибка парсинга: {param}")
     
     user = get_user(message.from_user.id)
     registered = user is not None
@@ -127,16 +160,16 @@ async def start_command(message: Message, state: FSMContext):
     # Уведомление для незарегистрированных
     if not registered:
         await message.answer(
-            "🌿 **Добро пожаловать в бот Global Trend!**\n\n"
-            "Мы предлагаем натуральные продукты для здоровья, красоты и долголетия.\n"
-            "Вы сможете подобрать средства по симптомам, узнать о доходах и стать партнёром.\n\n"
-            "📝 **Для доступа ко всем возможностям необходимо зарегистрироваться.**\n"
-            "Нажмите кнопку «📝 Регистрация» в главном меню.\n\n"
-            "После регистрации вам станут доступны:\n"
-            "• 🛒 Оформление заказов\n"
-            "• 👥 Партнерская программа\n"
-            "• 🔗 Ваша пригласительная ссылка\n"
-            "• 💰 Информация о доходе",
+            f"🌿 Добро пожаловать, {message.from_user.first_name}!\n\n"
+            "Здесь вы сможете понять, как повысить уровень энергии и улучшить самочувствие с помощью простых шагов и натуральных решений.\n\n"
+            "🔬 **Начните с диагностики**\n"
+            "Ответьте на несколько вопросов — получите ваш персональный индекс энергии и рекомендации.\n\n"
+            "👉 Нажмите «🔬 Пройти диагностику» в меню\n\n"
+            "После диагностики вы сможете:\n"
+            "• узнать персональные рекомендации\n"
+            "• посмотреть подходящие решения\n"
+            "• при желании открыть доступ ко всем возможностям (заказ, партнёрство, доход)\n\n"
+            "💚 Всё начинается с диагностики.",
             parse_mode="Markdown"
         )
     # Кнопка консультации только для зарегистрированных, не админов и не партнёров
@@ -192,6 +225,17 @@ async def my_link(message: Message):
             date = click.get("created_at", "")[:16] if click.get("created_at") else ""
             text += f"{i+1}. {icon} {name} — {date}\n"
     
+    # ===== СТАТИСТИКА ПО ИСТОЧНИКАМ =====
+    from database import get_user_link_stats
+    stats = get_user_link_stats(message.from_user.id)
+    if stats:
+        text += "\n📊 **Статистика по источникам:**\n"
+        for stat in stats:
+            conv = round(stat['registered'] / stat['total'] * 100, 1) if stat['total'] > 0 else 0
+            text += f"• {stat['source']}: {stat['total']} переходов, {stat['registered']} регистраций ({conv}%)\n"
+    else:
+        text += "\n📊 Пока нет переходов по вашей ссылке."
+    
     # 👇 ОТПРАВЛЯЕМ ТЕКСТ СО СТАТИСТИКОЙ
     await message.answer(text, parse_mode="Markdown")
     
@@ -221,16 +265,75 @@ async def my_sponsor(message: Message):
     else:
         await message.answer(f"Ваш наставник:\n\n{sponsor_user['fio']}")
 
+@dp.message(lambda m: m.text == "🔗 Ссылка с источником")
+async def custom_source_link_start(message: Message, state: FSMContext):
+    await state.set_state(CustomSource.waiting_source)
+    await message.answer(
+        "✏️ Введите название источника (например, `reklama_yandex` или `post_vk`).\n\n"
+        "Используйте буквы, цифры и нижнее подчёркивание. Без пробелов.",
+        parse_mode="Markdown"
+    )
+
+
+@dp.message(StateFilter(CustomSource.waiting_source))
+async def custom_source_link_generate(message: Message, state: FSMContext):
+    source_text = message.text.strip()
+    
+    # Проверяем, что строка допустима (только буквы, цифры, подчёркивание)
+    import re
+    if not re.match(r'^[a-zA-Z0-9_]+$', source_text):
+        await message.answer(
+            "❌ Недопустимые символы. Используйте только латинские буквы, цифры и нижнее подчёркивание.\n"
+            "Попробуйте снова:"
+        )
+        return
+    
+    user_id = message.from_user.id
+    link = f"https://t.me/{MAIN_BOT_USERNAME}?start=sponsor_{user_id}_source_{source_text}"
+    
+    # Генерируем QR-код
+    import qrcode
+    import os
+    from aiogram.types import FSInputFile
+    
+    qr = qrcode.make(link)
+    file_name = f"qr_{user_id}_{source_text}.png"
+    qr.save(file_name)
+    
+    await message.answer(
+        f"✅ **Ссылка с источником `{source_text}` готова:**\n\n"
+        f"`{link}`\n\n"
+        f"📊 Все переходы по этой ссылке будут отображаться в статистике с источником `{source_text}`.",
+        parse_mode="Markdown"
+    )
+    
+    await message.answer_photo(
+        FSInputFile(file_name),
+        caption=f"📱 QR-код для источника `{source_text}`"
+    )
+    
+    if os.path.exists(file_name):
+        os.remove(file_name)
+    
+    await state.clear()        
+        
 
 @dp.message(lambda m: m.text == "👥 Мои люди")
 async def my_people(message: Message):
-    users = get_referrals(message.from_user.id)
-    if not users:
+    from database import get_referrals_count, get_total_referrals_count, get_referrals
+    direct = get_referrals_count(message.from_user.id)
+    total = get_total_referrals_count(message.from_user.id)
+    
+    if total == 0:
         await message.answer("У вас пока нет людей в структуре.")
         return
-    text = f"👥 В вашей структуре: {len(users)} человек\n\n"
+    
+    users = get_referrals(message.from_user.id)  # прямые приглашённые
+    text = f"👥 Прямых: {direct}  |  Всего в структуре: {total}\n\n"
     for user in users:
-        text += f"• {user['fio']} — Статус: {user['status']}\n"
+        d = get_referrals_count(user['telegram_id'])
+        t = get_total_referrals_count(user['telegram_id'])
+        text += f"• {user['fio']} — Статус: {user['status']}  (в команде: {d} личных, {t} всего)\n"
     await message.answer(text, reply_markup=my_people_keyboard(users))
 
 
@@ -266,9 +369,9 @@ def get_status_text(status):
 
 
 def build_person_card(user):
-    from database import get_sponsor_chain
-    chain = get_sponsor_chain(user["telegram_id"])
-    chain_text = " → ".join([f"{s['fio']}" for s in chain]) if chain else "Нет спонсора"
+    from database import get_referrals_count, get_total_referrals_count
+    direct = get_referrals_count(user["telegram_id"])
+    total = get_total_referrals_count(user["telegram_id"])
     return (
         f"👤 {user['fio']}\n\n"
         f"🎂 Дата рождения: {user['birth_date']}\n"
@@ -276,7 +379,7 @@ def build_person_card(user):
         f"🏙️ Город: {user['city']}\n"
         f"👫 Пол: {user['gender']}\n\n"
         f"📊 Статус: {get_status_text(user['status'])}\n\n"
-        f"👆 Иерархия выше:\n{chain_text}"
+        f"👥 Команда: {direct} лично приглашенных, {total} всего в структуре"
     )
 
 
@@ -424,7 +527,14 @@ def get_user_dict(telegram_id):
  #       return
  #   text = "⏰ Требуют внимания\n\n" + "\n".join([f"👤 {u['fio']}\n📊 Статус: {u['status']}\n📱 {u['phone']}" for u in users])
  #   await message.answer(text)
-
+@dp.message(Command("cancel"))
+async def cancel_command(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.answer("❌ Нет активного процесса для отмены.")
+        return
+    await state.clear()
+    await message.answer("❌ Действие отменено.")
 
 async def main():
     print("Бот запущен")

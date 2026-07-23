@@ -10,9 +10,10 @@ from aiogram.types import (
 
 def get_main_menu(registered=False, has_team=False, is_admin=False):
     keyboard = []
-
+    keyboard.append([KeyboardButton(text="🔬 Пройти диагностику")])
     # 1. Продукты и доход
-    keyboard.append([KeyboardButton(text="📦 Продукты и доход")])
+    if registered:
+        keyboard.append([KeyboardButton(text="📦 Продукты и доход")])
 
     # 2. FAQ и Мой заказ
     row = [KeyboardButton(text="❓ FAQ")]
@@ -30,7 +31,9 @@ def get_main_menu(registered=False, has_team=False, is_admin=False):
         row.append(KeyboardButton(text="🔗 Профиль"))
     if row:
         keyboard.append(row)
-
+    from database import has_active_promotions
+    if has_active_promotions():
+        keyboard.append([KeyboardButton(text="🎁 Акции и подарки")])
     # 4. Админка
     if is_admin:
         keyboard.append([KeyboardButton(text="👑 Админка")])
@@ -81,7 +84,7 @@ team_submenu = ReplyKeyboardMarkup(
 profile_submenu = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👤 Мой наставник"), KeyboardButton(text="🔗 Моя ссылка")],
-        [KeyboardButton(text="📝 Мои данные")],
+        [KeyboardButton(text="🔗 Ссылка с источником"), KeyboardButton(text="📝 Мои данные")],
         [KeyboardButton(text="🏠 Главное меню")]
     ],
     resize_keyboard=True
@@ -96,10 +99,13 @@ admin_menu = ReplyKeyboardMarkup(
         [KeyboardButton(text="⏰ Клиенты без ответа"), KeyboardButton(text="👥 Все партнеры")],
         [KeyboardButton(text="📢 Сообщение всем"), KeyboardButton(text="🔄 Сменить спонсора")],
         [KeyboardButton(text="🛍 Управление товарами"), KeyboardButton(text="🏢 Города офисов")],
-        [KeyboardButton(text="👤 Без спонсора"), KeyboardButton(text="🏠 Главное меню")]
+        [KeyboardButton(text="👤 Без спонсора"), KeyboardButton(text="🎁 Управление акциями")],
+        [KeyboardButton(text="📊 Статистика переходов"), KeyboardButton(text="📊 AI Аналитика")],  # новая кнопка
+        [KeyboardButton(text="📊 Временные спонсоры"), KeyboardButton(text="🏠 Главное меню")]
     ],
     resize_keyboard=True
 )
+
 
 
 def all_products_keyboard():

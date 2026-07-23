@@ -71,3 +71,32 @@ class Quiz(StatesGroup):
 
 class AdminStates(StatesGroup):
     waiting_order_answer = State()    
+    
+class ReplyState(StatesGroup):
+    waiting_for_reply = State()
+    waiting_user_reply = State()    
+    
+# states.py - добавить в конец файла
+
+class Diagnostics(StatesGroup):
+    """Состояния для диагностики"""
+    waiting_question = State()    
+    
+class PromotionEdit(StatesGroup):
+    waiting_title = State()
+    waiting_description = State()
+    waiting_photo = State()
+    waiting_link = State()
+    waiting_expires = State()
+    waiting_confirm_delete = State()   
+    
+class InviteState(StatesGroup):
+    waiting_source = State()    
+    
+class CustomSource(StatesGroup):
+    waiting_source = State()    
+
+class AdminKnowledge(StatesGroup):
+    waiting_product_name = State()
+    waiting_product_description = State()
+    waiting_rule_text = State()    

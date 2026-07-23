@@ -10,7 +10,7 @@ import sqlite3
 sys.path.insert(0, os.path.dirname(__file__))
 
 from dotenv import load_dotenv
-
+from config import CONSULT_DB_PATH
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command, StateFilter
@@ -54,7 +54,7 @@ def safe_get(row, key, default=None):
 
 # ==================== БАЗА ДАННЫХ КОНСУЛЬТАЦИЙ ====================
 def init_consult_db():
-    conn = sqlite3.connect("consultations.db")
+    conn = sqlite3.connect(CONSULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS consult_requests (
@@ -71,7 +71,7 @@ def init_consult_db():
 
 
 def save_consult_request(user_id, sponsor_id):
-    conn = sqlite3.connect("consultations.db")
+    conn = sqlite3.connect(CONSULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO consult_requests (user_id, sponsor_id, status) VALUES (?, ?, 'active')",
@@ -84,7 +84,7 @@ def save_consult_request(user_id, sponsor_id):
 
 
 def get_active_consult(user_id):
-    conn = sqlite3.connect("consultations.db")
+    conn = sqlite3.connect(CONSULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT * FROM consult_requests WHERE user_id = ? AND status = 'active'",
@@ -96,7 +96,7 @@ def get_active_consult(user_id):
 
 
 def get_consult_by_id(consult_id):
-    conn = sqlite3.connect("consultations.db")
+    conn = sqlite3.connect(CONSULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "SELECT * FROM consult_requests WHERE id = ?",
@@ -108,7 +108,7 @@ def get_consult_by_id(consult_id):
 
 
 def update_consult_status(consult_id, status):
-    conn = sqlite3.connect("consultations.db")
+    conn = sqlite3.connect(CONSULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE consult_requests SET status = ? WHERE id = ?",
@@ -119,7 +119,7 @@ def update_consult_status(consult_id, status):
 
 
 def update_last_message(consult_id):
-    conn = sqlite3.connect("consultations.db")
+    conn = sqlite3.connect(CONSULT_DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
         "UPDATE consult_requests SET last_message_at = CURRENT_TIMESTAMP WHERE id = ?",
