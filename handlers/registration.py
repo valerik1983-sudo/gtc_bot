@@ -1,6 +1,7 @@
 import asyncio
 from aiogram import Router, F
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter
 
@@ -166,6 +167,23 @@ async def get_gender(message: Message, state: FSMContext):
             print(f"Ошибка отправки уведомления наставнику: {e}")
     
     await state.clear()
+    
+    # Проверяем, нужно ли вернуться к диагностике
+    data = await state.get_data()
+    if data.get("pending_recommendations"):
+        # Убираем флаг
+        await state.update_data(pending_recommendations=False)
+        # Показываем сообщение с кнопкой возврата к результату
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Посмотреть результат диагностики", callback_data="diag_back_to_result")]
+        ])
+        await message.answer(
+            "✅ Вы успешно зарегистрировались!\n\n"
+            "Теперь вы можете получить персональные рекомендации на основе диагностики.",
+            reply_markup=keyboard
+        )
+        # Не показываем главное меню повторно, т.к. пользователь сам вернётся к диагностике
+        return
     
     # Отправляем приветствие
     user = get_user(message.from_user.id)

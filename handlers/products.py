@@ -31,9 +31,6 @@ from database import (
     get_product_by_name,
     get_product_by_id
 )
-from data.products import PRODUCTS
-from data.stories import STORIES
-from data.programs import PROGRAMS
 
 router = Router()
 
@@ -93,7 +90,7 @@ async def show_product_card(message: Message):
     if not product:
         await message.answer("❌ Товар не найден")
         return
-    
+    product = dict(product)
     price = get_product_price(product_name)
     price_display = f"{price} руб." if price and price > 0 else "Цена не указана"
     
@@ -111,10 +108,15 @@ async def show_product_card(message: Message):
         [InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_name}")]
     ]
     
+    # Кнопка историй (если есть)
     stories = product['stories'] if product['stories'] else None
     if stories:
         keyboard_buttons.append([InlineKeyboardButton(text="📖 Истории клиентов", callback_data=f"product_stories_{product['id']}")])
-    
+
+    # Кнопка видео (если есть)
+    if product.get('video_url'):
+        keyboard_buttons.append([InlineKeyboardButton(text="🎬 Смотреть видео", url=product['video_url'])])
+        
     keyboard_buttons.append([InlineKeyboardButton(text="💬 Нужна консультация", url="https://t.me/gtcm_consult_bot")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
@@ -163,30 +165,66 @@ async def show_symptom_recommendation(callback: CallbackQuery):
     )
     await callback.answer()
 
-
 @router.callback_query(lambda c: c.data.startswith("product_"))
 async def show_product_from_callback(callback: CallbackQuery):
     product_name = callback.data.replace("product_", "")
     
-    product = PRODUCTS.get(product_name)
+    product = get_product_by_name(product_name)
     if not product:
         await callback.answer("Товар не найден")
         return
     
+    product = dict(product)  # 👈 преобразуем в словарь
+    
     price = get_product_price(product_name)
     price_text = f"\n\n💰 Цена: {price} руб." if price and price > 0 else ""
     
-    photo = FSInputFile(product["photo"])
+    # Формируем клавиатуру
+    keyboard_buttons = [
+        [InlineKeyboardButton(text="🛒 Добавить в корзину", callback_data=f"add_to_cart_{product_name}")]
+    ]
     
-    await callback.message.answer_photo(
-        photo=photo,
-        caption=f"**{product['title']}**\n\n{product['text']}{price_text}",
-        reply_markup=product_card_keyboard(product_name),
-        parse_mode="Markdown"
-    )
+    # Кнопка видео (если есть)
+    if product.get('video_url'):
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="🎬 Смотреть видео", url=product['video_url'])
+        ])
+    
+    # Кнопка историй (если есть)
+    if product.get('stories'):
+        keyboard_buttons.append([
+            InlineKeyboardButton(text="📖 Истории клиентов", callback_data=f"product_stories_{product['id']}")
+        ])
+    
+    # Кнопка консультации
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="💬 Нужна консультация", url="https://t.me/gtcm_consult_bot")
+    ])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    caption = f"**{product['name']}**\n\n{product['description']}{price_text}"
+    
+    # Отправляем с фото, если есть
+    photo_path = product.get('photo_path')
+    if photo_path and photo_path.startswith('AgAC'):
+        await callback.message.answer_photo(
+            photo=photo_path,
+            caption=caption,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    else:
+        await callback.message.answer(
+            caption,
+            reply_markup=keyboard,
+            parse_mode="Markdown"
+        )
+    
     await callback.answer()
 
-
+    
+    
 @router.callback_query(lambda c: c.data == "need_consultation")
 async def product_consultation(callback: CallbackQuery):
     await callback.message.answer("Напишите ваш вопрос и специалист свяжется с вами.")

@@ -1,6 +1,8 @@
 from aiogram import Router
 from aiogram.filters import StateFilter  # добавьте в начало файла
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from states import ReplyState
 from database import (
     get_user,
     get_sponsor_chain,
@@ -223,7 +225,39 @@ async def my_data(message: Message):
         if sponsor_user:
             text += f"\n\n👨‍🏫 **Ваш наставник:** {sponsor_user.get('fio', 'Неизвестно')}"
     
-    await message.answer(text, parse_mode="Markdown")        
+    await message.answer(text, parse_mode="Markdown")       
+    
+@router.message(StateFilter(ReplyState.waiting_user_reply))
+async def send_user_reply_main(message: Message, state: FSMContext):
+    """Отправляет ответ клиента наставнику (в основном боте)"""
+    data = await state.get_data()
+    mentor_id = data.get("reply_to_mentor_id")
+    consult_id = data.get("user_consult_id")
+    user_id = data.get("user_id")
+    
+    if not mentor_id:
+        await state.clear()
+        await message.answer("❌ Ошибка: не найден получатель.")
+        return
+    
+    try:
+        from database import get_user
+        user = get_user(user_id)
+        user_name = user.get('fio', 'Пользователь') if user else 'Пользователь'
+        
+        # Отправляем ответ наставнику
+        await message.bot.send_message(
+            mentor_id,
+            f"💬 **{user_name}:**\n\n{message.text}",
+            parse_mode="Markdown"
+        )
+        
+        await message.answer("✅ Ваш ответ отправлен наставнику!")
+        
+    except Exception as e:
+        await message.answer(f"❌ Ошибка: {e}")
+    
+    await state.clear()    
 
 
     

@@ -4,15 +4,27 @@ from aiogram import Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.filters import Command, StateFilter
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
-from states import Registration
+from states import Registration, AdminKnowledge  # <-- ДОБАВЛЕН AdminKnowledge
 from datetime import datetime
 from config import MAIN_BOT_TOKEN, CONSULT_BOT_USERNAME
 import asyncio
 from aiogram.types import ReplyKeyboardRemove
 
-
-
-
+from handlers.promotions import admin_promotions_menu
+from handlers.promotions import (
+    admin_add_promo_start,
+    admin_edit_promo,
+    promo_edit_title,
+    promo_edit_desc,
+    promo_edit_photo,
+    promo_edit_link,
+    promo_edit_expires,
+    promo_toggle,
+    promo_delete,
+    promo_confirm_delete,
+    admin_back_to_promos,
+    admin_back_to_admin
+)
 from keyboards import (
     team_submenu, profile_submenu, get_main_menu, admin_menu, 
     products_menu_keyboard
@@ -23,16 +35,34 @@ from states import OrderCheckout
 router = Router()
 from database import is_admin, get_system_stats, get_all_partners, get_old_consultations, update_sponsor, get_user, get_office_cities, get_all_products_from_db, sync_products_from_file, get_product_price
 from database import update_product_in_db, get_product_by_id, get_all_users
+from database import get_temp_sponsor, clear_temp_sponsor
 from database import (
-    # ... другие импорты ...
     add_user,
     get_unprocessed_orders,
     get_order_waiting_time,
+    get_admin_link_stats,
     mark_order_as_processed
 )
     
 from states import Broadcast
+from states import PromotionEdit
+from database import (
+    get_all_promotions,
+    get_promotion_by_id,
+    add_promotion,
+    update_promotion,
+    delete_promotion
+)
 
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ АДМИН-ДИАЛОГОВ ==========
+# (импортируем из admin_knowledge, чтобы не засорять файл)
+from handlers.admin_knowledge import (
+    detect_intent,
+    start_admin_dialog,
+    process_product_name,
+    process_product_description,
+    process_rule_text
+)
 
 @router.message(F.text == "📝 Регистрация")
 async def start_registration(message: Message, state: FSMContext):
@@ -199,11 +229,15 @@ async def get_is_partner(message: Message, state: FSMContext):
     
     # Если не партнёр - продолжаем регистрацию
     data = await state.get_data()
+    # ===== ВАЖНО: получаем sponsor_id из state или из temp_refs =====
     sponsor_id = data.get("sponsor_id")
-    print(f"🔵🔵🔵 СПОНСОР ИЗ СОСТОЯНИЯ: {sponsor_id} 🔵🔵🔵")
-    
-     
-    # Сохраняем пользователя с ролью lead
+    if not sponsor_id:
+        from database import get_temp_sponsor
+        sponsor_id = get_temp_sponsor(message.from_user.id)
+        print(f"🔵🔵🔵 ВЗЯЛИ SPONSOR_ID ИЗ TEMP_REFS: {sponsor_id}")
+
+    # ===== Сохраняем пользователя =====
+    from database import add_user, clear_temp_sponsor
     add_user(
         telegram_id=message.from_user.id,
         username=message.from_user.username,
@@ -213,25 +247,27 @@ async def get_is_partner(message: Message, state: FSMContext):
         city=data["city"],
         gender=data["gender"],
         sponsor_id=sponsor_id,
-        role="lead"  # 👈 Обычный пользователь
+        role="lead"
     )
-    
-    # Отправляем уведомление наставнику
+
+    # ===== Удаляем временную связь после регистрации =====
     if sponsor_id:
-        try:
-            bot = Bot(token=MAIN_BOT_TOKEN)
-        
+        clear_temp_sponsor(message.from_user.id)
+    
+    # ===== Отправляем уведомления =====
+    try:
+        # Уведомление наставнику (если есть)
+        if sponsor_id:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(
-                    text="💬 Перейти в консультационный бот", 
+                    text="💬 Перейти в консультационный бот",
                     url=f"https://t.me/{CONSULT_BOT_USERNAME}"
-                 )]
+                )]
             ])
-        
-            # Проверяем статус наставника
+
             sponsor = get_user(sponsor_id)
             sponsor_is_partner = sponsor and sponsor.get('role') == 'partner' if sponsor else False
-            
+
             message_text = (
                 f"🆕 **Новый приглашённый!**\n\n"
                 f"👤 **Имя:** {data['fio']}\n"
@@ -241,55 +277,68 @@ async def get_is_partner(message: Message, state: FSMContext):
                 f"🎂 **Дата рождения:** {data['birth_date']}\n\n"
                 f"✅ Пользователь зарегистрировался по вашей ссылке!\n\n"
             )
-            
+
             if not sponsor_is_partner:
                 message_text += (
                     f"⚠️ **Внимание!** Чтобы получать вознаграждение за приглашённых, "
                     f"вам необходимо зарегистрироваться в компании (приобрести продукт).\n\n"
                 )
-            
+
             message_text += (
                 f"💡 **Важно:** Чтобы получать уведомления о консультациях, "
                 f"нажмите /start в [консультационном боте](https://t.me/{CONSULT_BOT_USERNAME})"
             )
-        
-            await bot.send_message(
+
+            await message.bot.send_message(
                 sponsor_id,
                 message_text,
                 reply_markup=keyboard,
                 parse_mode="Markdown",
                 disable_web_page_preview=True
             )
-        
-            await bot.session.close()
-        
-        except Exception as e:
-            print(f"Ошибка отправки уведомления наставнику: {e}")
-    
+
+        # Уведомление админу о регистрации без спонсора
+        else:
+            from config import ADMIN_ID
+            admin_id = ADMIN_ID if ADMIN_ID else 258670125  # ваш ID, если не задан в config
+            await message.bot.send_message(
+                admin_id,
+                f"🆕 **Новый пользователь без спонсора!**\n\n"
+                f"👤 **ФИО:** {data['fio']}\n"
+                f"📱 **Телефон:** {data['phone']}\n"
+                f"🏙️ **Город:** {data['city']}\n"
+                f"🆔 **ID:** {message.from_user.id}\n"
+                f"📅 **Дата регистрации:** {datetime.now().strftime('%d.%m.%Y %H:%M')}\n\n"
+                f"Назначьте ему спонсора через админ-панель.",
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        print(f"Ошибка отправки уведомлений: {e}")
+
     await state.clear()
-    
+
     # Отправляем приветствие
     user = get_user(message.from_user.id)
     registered = user is not None
     has_team = False
     is_admin_user = is_admin(message.from_user.id)
-    
+
     await message.answer(
         f"✅ **Регистрация завершена!**\n\n"
         f"Добро пожаловать, {data['fio']}!\n\n"
-        f"📌 Вы зарегистрированы как пользователь.\n\n"
+        "Теперь у вас открыт полный доступ к системе.\n\n"
         f"Чтобы стать партнёром и получать вознаграждения, приобретите продукт компании.",
         reply_markup=get_main_menu(registered, has_team, is_admin_user),
         parse_mode="Markdown"
-    )    
-
+    )
 
 # ==================== АДМИНКА ПРЯМО В MENU ====================
 
 @router.message(F.text.in_([
     "👑 Админка", "📊 Статистика системы", "⚠️ Жалобы", "⏰ Клиенты без ответа",
     "👥 Все партнеры", "📢 Сообщение всем", "🔄 Сменить спонсора",
-    "🛍 Управление товарами", "🏢 Города офисов", "👤 Без спонсора"
+    "🛍 Управление товарами", "🏢 Города офисов", "👤 Без спонсора",
+    "🎁 Управление акциями", "📊 Статистика переходов", "📊 Временные спонсоры"
 ]))
 async def admin_handler(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
@@ -303,22 +352,66 @@ async def admin_handler(message: Message, state: FSMContext):
         stats = get_system_stats()
         await message.answer(f"📊 Системa\n\n👥 Пользователей: {stats['users']}\n📅 Консультаций: {stats['consultations']}")
     
-    elif message.text == "👥 Все партнеры":
-        from database import get_all_partners
+    elif message.text == "📊 AI Аналитика":
+        from services.analytics import get_analytics_summary
+        stats = get_analytics_summary()
+        text = f"📊 AI Аналитика\n\n"
+        text += f"Всего диалогов: {stats['total']}\n"
+        text += f"Передано наставнику: {stats['forwarded']}\n\n"
+        text += "Темы:\n"
+        for topic, count in stats['topics']:
+            text += f"  • {topic}: {count}\n"
+        text += "\nПродукты:\n"
+        for product, count in stats['products']:
+            text += f"  • {product}: {count}\n"
+        await message.answer(text, parse_mode="Markdown")
+
+
+    elif message.text == "👥 Все партнеры":      
+        
+        from database import get_all_partners, get_connection
+
         partners = get_all_partners()
         if not partners:
             await message.answer("Нет партнёров в системе")
             return
         
-        keyboard = []
+        # Подключаемся к БД и проверяем диагностику
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        partners_with_diag = []
+        partners_without_diag = []
+
         for partner in partners:
+            user_id = partner['telegram_id']
+            cursor.execute("SELECT COUNT(*) FROM diagnostic_results WHERE user_id = ?", (user_id,))
+            count = cursor.fetchone()[0]
+            if count > 0:
+                partners_with_diag.append(partner)
+            else:
+                partners_without_diag.append(partner)
+
+        conn.close()
+
+        # Формируем клавиатуру
+        keyboard = []
+
+        for partner in partners_with_diag:
+            keyboard.append([InlineKeyboardButton(
+                text=f"🧬 {partner['fio']} (ID: {partner['telegram_id']})",
+                callback_data=f"show_tree_{partner['telegram_id']}"
+            )])
+
+        for partner in partners_without_diag:
             keyboard.append([InlineKeyboardButton(
                 text=f"{partner['fio']} (ID: {partner['telegram_id']})",
                 callback_data=f"show_tree_{partner['telegram_id']}"
             )])
-        
+
         await message.answer(
-            "🌳 **Выберите партнёра для просмотра реферального дерева:**",
+            "🌳 **Выберите партнёра для просмотра реферального дерева:**\n\n"
+            "🧬 — прошёл диагностику",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
             parse_mode="Markdown"
         )
@@ -474,7 +567,42 @@ async def admin_handler(message: Message, state: FSMContext):
             text += f"  📅 {user['created_at']}\n\n"
         
         await message.answer(text, parse_mode="Markdown")
-
+    elif message.text == "🎁 Управление акциями":
+        await admin_promotions_menu(message)
+        
+    elif message.text == "📊 Статистика переходов":
+        from database import get_admin_link_stats
+        stats = get_admin_link_stats()
+        if not stats:
+            await message.answer("Нет данных о переходах.")
+            return
+        text = "📊 **Общая статистика переходов**\n\n"
+        for row in stats:
+            text += f"👤 **{row['fio']}** (ID: {row['sponsor_id']})\n"
+            text += f"   Всего переходов: {row['total']}\n"
+            text += f"   Регистраций: {row['registered']}\n"
+            conv = round(row['registered'] / row['total'] * 100, 1) if row['total'] > 0 else 0
+            text += f"   Конверсия: {conv}%\n"
+            if row.get('sources'):
+                text += "   📌 По источникам:\n"
+                for src in row['sources']:
+                    text += f"      • {src['source']}: {src['count']} переходов\n"
+            text += "\n"
+        await message.answer(text, parse_mode="Markdown")    
+    elif message.text == "📊 Временные спонсоры":
+        from database import get_temp_refs_full
+        rows = get_temp_refs_full()
+        if not rows:
+            await message.answer("Нет записей в temp_refs.")
+            return
+        text = "📊 **Временные спонсоры**\n\n"
+        for row in rows[:20]:
+            status = "✅ зарегистрирован" if row['registered'] else "⏳ не зарегистрирован"
+            text += f"🆔 {row['telegram_id']} → спонсор: {row['sponsor_fio'] or row['sponsor_id']} (источник: {row['source']})\n"
+            text += f"   {status}, {row['created_at']}\n\n"
+        if len(rows) > 20:
+            text += f"\n... и ещё {len(rows)-20} записей."
+        await message.answer(text, parse_mode="Markdown")    
 
 # ============ КОЛБЭКИ ДЛЯ НЕОБРАБОТАННЫХ ЗАКАЗОВ ============
 # Эти обработчики должны быть ВНЕ функции admin_handler
@@ -876,6 +1004,7 @@ async def admin_edit_product_form(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📄 Изменить описание", callback_data="admin_edit_desc")],
         [InlineKeyboardButton(text="💰 Изменить цену", callback_data="admin_edit_price")],
         [InlineKeyboardButton(text="🖼 Изменить фото", callback_data="admin_edit_photo")],
+        [InlineKeyboardButton(text="🎬 Добавить видео", callback_data="admin_edit_video")],
         [InlineKeyboardButton(text="🩺 Изменить симптомы", callback_data="admin_edit_symptoms")],
         [InlineKeyboardButton(text="📖 Изменить истории", callback_data="admin_edit_stories")],
         [InlineKeyboardButton(text="🎁 Изменить программы", callback_data="admin_edit_programs")],
@@ -1294,6 +1423,65 @@ async def admin_edit_programs_save(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
     await state.clear() 
 
+@router.callback_query(F.data == "admin_edit_video")
+async def admin_edit_video_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state("admin_waiting_video")
+    await callback.message.answer(
+        "🎬 Введите ссылку на видео (YouTube, Vimeo или любой другой хостинг):\n\n"
+        "Пример: https://www.youtube.com/watch?v=XXXXX"
+    )
+    await callback.answer()    
+
+@router.message(StateFilter("admin_waiting_video"))
+async def admin_edit_video_save(message: Message, state: FSMContext):
+    video_url = message.text.strip()
+    if not video_url.startswith(('http://', 'https://')):
+        await message.answer("❌ Введите корректную ссылку (начинается с http:// или https://):")
+        return
+
+    data = await state.get_data()
+    product_id = data.get("editing_product_id")
+    if not product_id:
+        await message.answer("❌ Ошибка: товар не найден")
+        await state.clear()
+        return
+
+    from database import update_product_in_db, get_product_by_id, get_product_price
+    update_product_in_db(product_id, video_url=video_url)
+
+    await message.answer("✅ Видео сохранено!")
+
+    # Возвращаемся к форме редактирования
+    product = get_product_by_id(product_id)
+    if product:
+        product = dict(product)  # преобразуем в словарь, чтобы использовать .get()
+        price = get_product_price(product['name'])
+        price_display = f"{price} руб." if price and price > 0 else "не указана"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Изменить название", callback_data="admin_edit_name")],
+            [InlineKeyboardButton(text="📄 Изменить описание", callback_data="admin_edit_desc")],
+            [InlineKeyboardButton(text="💰 Изменить цену", callback_data="admin_edit_price")],
+            [InlineKeyboardButton(text="🖼 Изменить фото", callback_data="admin_edit_photo")],
+            [InlineKeyboardButton(text="🎬 Добавить видео", callback_data="admin_edit_video")],
+            [InlineKeyboardButton(text="🩺 Изменить симптомы", callback_data="admin_edit_symptoms")],
+            [InlineKeyboardButton(text="📖 Изменить истории", callback_data="admin_edit_stories")],
+            [InlineKeyboardButton(text="🎁 Изменить программы", callback_data="admin_edit_programs")],
+            [InlineKeyboardButton(text="🗑 Удалить товар", callback_data="admin_delete_product")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_list_products")]
+        ])
+
+        text = f"**{product['name']}**\n\n"
+        text += f"📄 {product['description'][:100]}...\n" if product['description'] else ""
+        text += f"💰 {price_display}\n"
+        text += f"🎬 Видео: {'есть' if product.get('video_url') else 'нет'}\n"
+
+        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message.answer("❌ Товар не найден")
+
+    await state.clear()    
+    
 
 @router.callback_query(F.data == "admin_delete_product")
 async def admin_delete_product(callback: CallbackQuery, state: FSMContext):
@@ -1411,12 +1599,494 @@ async def admin_back_to_cities(callback: CallbackQuery):
         parse_mode="Markdown"
     )
     await callback.answer()
+    
+# ==================== АКЦИИ И ПОДАРКИ ====================
+
+# ----- ПОЛЬЗОВАТЕЛЬСКАЯ ЧАСТЬ -----
+@router.message(F.text == "🎁 Акции и подарки")
+async def show_promotions(message: Message):
+    promotions = get_all_promotions(active_only=True)
+
+    if not promotions:
+        await message.answer(
+            "🎁 **Акции и подарки**\n\n"
+            "На данный момент активных акций нет.\n"
+            "Следите за обновлениями!",
+            parse_mode="Markdown"
+        )
+        return
+
+    for promo in promotions:
+        text = f"🎁 **{promo['title']}**\n\n{promo['description']}"
+        if promo.get('link'):
+            text += f"\n\n🔗 [Подробнее]({promo['link']})"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Перейти по ссылке", url=promo['link'])]
+        ]) if promo.get('link') else None
+
+        if promo.get('photo_id'):
+            await message.answer_photo(
+                photo=promo['photo_id'],
+                caption=text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+        else:
+            await message.answer(
+                text,
+                reply_markup=keyboard,
+                parse_mode="Markdown"
+            )
+
+
+# ----- АДМИНСКАЯ ЧАСТЬ -----
+async def admin_promotions_menu(message: Message):
+    """Меню управления акциями (вызывается из admin_handler)"""
+    if not is_admin(message.from_user.id):
+        return
+
+    promotions = get_all_promotions()
+
+    if not promotions:
+        await message.answer(
+            "🎁 Управление акциями\n\n"
+            "Акций пока нет. Нажмите «➕ Добавить акцию», чтобы создать первую.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить акцию", callback_data="admin_add_promo")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back_to_admin")]
+            ])
+        )
+        return
+
+    keyboard = []
+    for promo in promotions:
+        status_icon = "✅" if promo['is_active'] else "❌"
+        keyboard.append([
+            InlineKeyboardButton(
+                text=f"{status_icon} {promo['title'][:30]}",
+                callback_data=f"admin_edit_promo_{promo['id']}"
+            )
+        ])
+    keyboard.append([InlineKeyboardButton(text="➕ Добавить акцию", callback_data="admin_add_promo")])
+    keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back_to_admin")])
+
+    await message.answer(
+        "🎁 **Управление акциями**\n\n"
+        "Выберите акцию для редактирования или добавьте новую.\n"
+        "✅ — активна, ❌ — неактивна.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="Markdown"
+    )
+
+
+# ---------- ДОБАВЛЕНИЕ АКЦИИ С КНОПКОЙ ОТМЕНЫ ----------
+
+@router.callback_query(F.data == "admin_add_promo")
+async def admin_add_promo_start(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    await state.set_state(PromotionEdit.waiting_title)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+    ])
+    await callback.message.answer("✏️ Введите заголовок акции:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(StateFilter(PromotionEdit.waiting_title))
+async def admin_add_promo_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text)
+    await state.set_state(PromotionEdit.waiting_description)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+    ])
+    await message.answer("📄 Введите описание акции (можно с форматированием Markdown):", reply_markup=keyboard)
+
+
+@router.message(StateFilter(PromotionEdit.waiting_description))
+async def admin_add_promo_description(message: Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await state.set_state(PromotionEdit.waiting_photo)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+    ])
+    await message.answer(
+        "🖼 Отправьте фото для акции (или отправьте 'пропустить'):\n\n"
+        "Фото будет отображаться в карточке акции.",
+        reply_markup=keyboard
+    )
+
+
+@router.message(StateFilter(PromotionEdit.waiting_photo))
+async def admin_add_promo_photo(message: Message, state: FSMContext):
+    photo_id = None
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+    elif message.text and message.text.lower() == "пропустить":
+        photo_id = None
+    else:
+        # Оставляем клавиатуру с отменой
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+        ])
+        await message.answer("❌ Отправьте фото или напишите 'пропустить'", reply_markup=keyboard)
+        return
+
+    await state.update_data(photo_id=photo_id)
+    await state.set_state(PromotionEdit.waiting_link)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+    ])
+    await message.answer(
+        "🔗 Введите ссылку для перехода (например, https://... ) или отправьте 'пропустить':",
+        reply_markup=keyboard
+    )
+
+
+@router.message(StateFilter(PromotionEdit.waiting_link))
+async def admin_add_promo_link(message: Message, state: FSMContext):
+    link = None
+    if message.text and message.text.lower() != "пропустить":
+        if not message.text.startswith(('http://', 'https://')):
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+            ])
+            await message.answer("❌ Ссылка должна начинаться с http:// или https://. Попробуйте снова:", reply_markup=keyboard)
+            return
+        link = message.text
+    await state.update_data(link=link)
+    await state.set_state(PromotionEdit.waiting_expires)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+    ])
+    await message.answer(
+        "📅 Введите дату истечения акции (необязательно) в формате ДД.ММ.ГГГГ\n"
+        "или отправьте 'пропустить', если акция бессрочная:",
+        reply_markup=keyboard
+    )
+
+
+@router.message(StateFilter(PromotionEdit.waiting_expires))
+async def admin_add_promo_expires(message: Message, state: FSMContext):
+    expires_at = None
+    if message.text and message.text.lower() != "пропустить":
+        try:
+            from datetime import datetime
+            expires_at = datetime.strptime(message.text, "%d.%m.%Y").strftime("%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel_promo")]
+            ])
+            await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ или 'пропустить':", reply_markup=keyboard)
+            return
+
+    data = await state.get_data()
+    promo_id = add_promotion(
+        title=data['title'],
+        description=data['description'],
+        photo_id=data.get('photo_id'),
+        link=data.get('link'),
+        expires_at=expires_at
+    )
+
+    await message.answer(f"✅ Акция **{data['title']}** успешно добавлена! (ID: {promo_id})")
+    await state.clear()
+    await admin_promotions_menu(message)
+
+
+# ---------- КНОПКА ОТМЕНЫ ----------
+@router.callback_query(F.data == "admin_cancel_promo")
+async def admin_cancel_promo(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Создание акции отменено.")
+    await admin_promotions_menu(callback.message)
+    await callback.answer()
+
+
+# ---------- РЕДАКТИРОВАНИЕ АКЦИЙ ----------
+@router.callback_query(F.data.startswith("admin_edit_promo_"))
+async def admin_edit_promo(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    promo_id = int(callback.data.split("_")[3])
+    promo = get_promotion_by_id(promo_id)
+    if not promo:
+        await callback.message.answer("❌ Акция не найдена")
+        await callback.answer()
+        return
+
+    await state.update_data(edit_promo_id=promo_id)
+
+    status_text = "🟢 Активна" if promo['is_active'] else "🔴 Неактивна"
+    text = (
+        f"🎁 **{promo['title']}**\n\n"
+        f"{promo['description']}\n\n"
+        f"📅 Создана: {promo['created_at']}\n"
+        f"⏳ Истекает: {promo['expires_at'] or 'бессрочно'}\n"
+        f"📊 Статус: {status_text}\n"
+        f"🔗 Ссылка: {promo['link'] or 'нет'}\n"
+        f"🖼 Фото: {'есть' if promo['photo_id'] else 'нет'}"
+    )
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить заголовок", callback_data="promo_edit_title")],
+        [InlineKeyboardButton(text="✏️ Изменить описание", callback_data="promo_edit_desc")],
+        [InlineKeyboardButton(text="🖼 Изменить фото", callback_data="promo_edit_photo")],
+        [InlineKeyboardButton(text="🔗 Изменить ссылку", callback_data="promo_edit_link")],
+        [InlineKeyboardButton(text="📅 Изменить срок", callback_data="promo_edit_expires")],
+        [InlineKeyboardButton(text="🔄 Переключить статус", callback_data=f"promo_toggle_{promo_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"promo_delete_{promo_id}")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_back_to_promos")]
+    ])
+
+    await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()
+
+
+# ---------- РЕДАКТИРОВАНИЕ ПОЛЕЙ ----------
+@router.callback_query(F.data == "promo_edit_title")
+async def promo_edit_title(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PromotionEdit.waiting_title)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+    ])
+    await callback.message.answer("✏️ Введите новый заголовок:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(StateFilter(PromotionEdit.waiting_title))
+async def promo_save_title(message: Message, state: FSMContext):
+    data = await state.get_data()
+    promo_id = data.get('edit_promo_id')
+    if not promo_id:
+        await message.answer("❌ Ошибка: акция не найдена")
+        await state.clear()
+        return
+    update_promotion(promo_id, title=message.text)
+    await message.answer("✅ Заголовок обновлён!")
+    await state.clear()
+    await admin_promotions_menu(message)
+
+
+@router.callback_query(F.data == "promo_edit_desc")
+async def promo_edit_desc(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PromotionEdit.waiting_description)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+    ])
+    await callback.message.answer("✏️ Введите новое описание:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(StateFilter(PromotionEdit.waiting_description))
+async def promo_save_desc(message: Message, state: FSMContext):
+    data = await state.get_data()
+    promo_id = data.get('edit_promo_id')
+    if not promo_id:
+        await message.answer("❌ Ошибка: акция не найдена")
+        await state.clear()
+        return
+    update_promotion(promo_id, description=message.text)
+    await message.answer("✅ Описание обновлено!")
+    await state.clear()
+    await admin_promotions_menu(message)
+
+
+@router.callback_query(F.data == "promo_edit_photo")
+async def promo_edit_photo(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PromotionEdit.waiting_photo)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+    ])
+    await callback.message.answer("🖼 Отправьте новое фото (или 'удалить' чтобы убрать):", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(StateFilter(PromotionEdit.waiting_photo))
+async def promo_save_photo(message: Message, state: FSMContext):
+    data = await state.get_data()
+    promo_id = data.get('edit_promo_id')
+    if not promo_id:
+        await message.answer("❌ Ошибка: акция не найдена")
+        await state.clear()
+        return
+
+    if message.photo:
+        photo_id = message.photo[-1].file_id
+        update_promotion(promo_id, photo_id=photo_id)
+        await message.answer("✅ Фото обновлено!")
+    elif message.text and message.text.lower() == "удалить":
+        update_promotion(promo_id, photo_id=None)
+        await message.answer("✅ Фото удалено!")
+    else:
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+        ])
+        await message.answer("❌ Отправьте фото или напишите 'удалить'", reply_markup=keyboard)
+        return
+
+    await state.clear()
+    await admin_promotions_menu(message)
+
+
+@router.callback_query(F.data == "promo_edit_link")
+async def promo_edit_link(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PromotionEdit.waiting_link)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+    ])
+    await callback.message.answer("🔗 Введите новую ссылку (или 'удалить' чтобы убрать):", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(StateFilter(PromotionEdit.waiting_link))
+async def promo_save_link(message: Message, state: FSMContext):
+    data = await state.get_data()
+    promo_id = data.get('edit_promo_id')
+    if not promo_id:
+        await message.answer("❌ Ошибка: акция не найдена")
+        await state.clear()
+        return
+
+    if message.text.lower() == "удалить":
+        update_promotion(promo_id, link=None)
+        await message.answer("✅ Ссылка удалена!")
+    else:
+        if not message.text.startswith(('http://', 'https://')):
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+            ])
+            await message.answer("❌ Ссылка должна начинаться с http:// или https://. Попробуйте снова:", reply_markup=keyboard)
+            return
+        update_promotion(promo_id, link=message.text)
+        await message.answer("✅ Ссылка обновлена!")
+
+    await state.clear()
+    await admin_promotions_menu(message)
+
+
+@router.callback_query(F.data == "promo_edit_expires")
+async def promo_edit_expires(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(PromotionEdit.waiting_expires)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+    ])
+    await callback.message.answer("📅 Введите новую дату истечения (ДД.ММ.ГГГГ) или 'удалить' чтобы сделать бессрочной:", reply_markup=keyboard)
+    await callback.answer()
+
+
+@router.message(StateFilter(PromotionEdit.waiting_expires))
+async def promo_save_expires(message: Message, state: FSMContext):
+    data = await state.get_data()
+    promo_id = data.get('edit_promo_id')
+    if not promo_id:
+        await message.answer("❌ Ошибка: акция не найдена")
+        await state.clear()
+        return
+
+    if message.text.lower() == "удалить":
+        update_promotion(promo_id, expires_at=None)
+        await message.answer("✅ Срок истечения убран (бессрочная акция)")
+    else:
+        try:
+            from datetime import datetime
+            expires_at = datetime.strptime(message.text, "%d.%m.%Y").strftime("%Y-%m-%d %H:%M:%S")
+            update_promotion(promo_id, expires_at=expires_at)
+            await message.answer(f"✅ Дата истечения установлена на {message.text}")
+        except ValueError:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="promo_cancel_edit")]
+            ])
+            await message.answer("❌ Неверный формат даты. Используйте ДД.ММ.ГГГГ или 'удалить'", reply_markup=keyboard)
+            return
+
+    await state.clear()
+    await admin_promotions_menu(message)
+
+
+# ---------- ОТМЕНА РЕДАКТИРОВАНИЯ ----------
+@router.callback_query(F.data == "promo_cancel_edit")
+async def promo_cancel_edit(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("❌ Редактирование отменено.")
+    await admin_promotions_menu(callback.message)
+    await callback.answer()
+
+
+# ---------- ПЕРЕКЛЮЧЕНИЕ СТАТУСА ----------
+@router.callback_query(F.data.startswith("promo_toggle_"))
+async def promo_toggle(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    promo_id = int(callback.data.split("_")[2])
+    promo = get_promotion_by_id(promo_id)
+    if not promo:
+        await callback.message.answer("❌ Акция не найдена")
+        await callback.answer()
+        return
+    new_status = 0 if promo['is_active'] else 1
+    update_promotion(promo_id, is_active=new_status)
+    status_text = "активирована" if new_status else "деактивирована"
+    await callback.message.answer(f"✅ Акция {status_text}!")
+    await callback.answer()
+    await admin_promotions_menu(callback.message)
+
+
+# ---------- УДАЛЕНИЕ ----------
+@router.callback_query(F.data.startswith("promo_delete_"))
+async def promo_delete(callback: CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        return
+    promo_id = int(callback.data.split("_")[2])
+    promo = get_promotion_by_id(promo_id)
+    if not promo:
+        await callback.message.answer("❌ Акция не найдена")
+        await callback.answer()
+        return
+
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"promo_confirm_delete_{promo_id}")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_back_to_promos")]
+    ])
+    await callback.message.answer(
+        f"⚠️ Вы уверены, что хотите удалить акцию **{promo['title']}**?",
+        reply_markup=keyboard,
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+    
+    
+
+
+@router.callback_query(F.data.startswith("promo_confirm_delete_"))
+async def promo_confirm_delete(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        return
+    promo_id = int(callback.data.split("_")[3])
+    delete_promotion(promo_id)
+    await callback.message.answer("✅ Акция удалена!")
+    await callback.answer()
+    await admin_promotions_menu(callback.message)
+
+
+# ---------- НАЗАД ----------
+@router.callback_query(F.data == "admin_back_to_promos")
+async def admin_back_to_promos(callback: CallbackQuery):
+    await admin_promotions_menu(callback.message)
+    await callback.answer()
 
 
 # ==================== ГЛАВНОЕ МЕНЮ ====================
 
+@router.message(F.text == "🔬 Пройти диагностику")
+async def diagnostics_button_handler(message: Message, state: FSMContext):
+    """Обработка кнопки диагностики из меню"""
+    from handlers.diagnostics import start_diagnostics
+    await start_diagnostics(message, state)
+
 @router.message(F.text == "📦 Продукты и доход")
-async def products_category(message: Message):
+async def products_category(message: Message, state: FSMContext):
     print("🔴🔴🔴 products_category ВЫЗВАН 🔴🔴🔴")
     
     user = get_user(message.from_user.id)
@@ -1559,7 +2229,6 @@ async def products_category(message: Message):
 
     
 
-
 @router.message(F.text == "👥 Команда")
 async def team_category(message: Message):
     await message.answer("👥 Управление командой:", reply_markup=team_submenu)
@@ -1677,7 +2346,41 @@ async def back_to_main_menu(message: Message, state: FSMContext):
     is_admin_user = is_admin(message.from_user.id)
     await message.answer("🏠 Главное меню", reply_markup=get_main_menu(registered, has_team, is_admin_user))
 
+@router.callback_query(lambda c: c.data.startswith("consult_request_"))
+async def create_consult_request(callback: CallbackQuery):
+    user_id = int(callback.data.split("_")[2])
+    from database import get_user
+    user = get_user(user_id)
+    if not user:
+        await callback.message.answer("Пользователь не найден.")
+        await callback.answer()
+        return
 
+    sponsor_id = user.get('sponsor_id')
+    if sponsor_id:
+        try:
+            from aiogram import Bot
+            from config import CONSULT_BOT_TOKEN
+            consult_bot = Bot(token=CONSULT_BOT_TOKEN)
+            # Получаем последний вопрос пользователя из памяти
+            from services.memory import memory
+            history = memory.get_history(user_id, limit=1)
+            last_question = history[-1]["content"] if history else "Нет вопроса"
+            await consult_bot.send_message(
+                sponsor_id,
+                f"🆕 Новая заявка на консультацию от пользователя {user.get('fio', 'Пользователь')} (ID: {user_id})\n"
+                f"Вопрос: {last_question}\n"
+                f"Телефон: {user.get('phone', 'Не указан')}\n"
+                f"Город: {user.get('city', 'Не указан')}\n"
+                f"Для ответа перейдите в консультационный бот."
+            )
+            await callback.message.answer("✅ Заявка передана вашему наставнику. Ожидайте ответа.")
+        except Exception as e:
+            logger.error(f"Ошибка отправки уведомления наставнику: {e}")
+            await callback.message.answer("❌ Не удалось отправить заявку. Попробуйте позже.")
+    else:
+        await callback.message.answer("❌ У вас нет наставника. Обратитесь к администратору.")
+    await callback.answer()
 
 # ==================== ОБРАБОТКА ЧАВО ====================
 
@@ -1773,15 +2476,51 @@ async def handle_all_messages(message: Message, state: FSMContext):
     from states import OrderCheckout
     from database import get_all_products_from_db
     from handlers.quiz import cancel_quiz
+    from states import ReplyState
     
     
     current_state = await state.get_state()
     print(f"🔵🔵🔵 handle_all_messages: состояние={current_state}, текст={message.text}")
 
-    # ===== ПРОВЕРКА ДЛЯ РЕГИСТРАЦИИ (ДОБАВИТЬ СЮДА) =====
+    # ---- 1. Проверка админ-команд (естественный язык) ----
+    # Срабатывает только если пользователь админ и намерение распознано
+    # (вызов должен быть ПЕРЕД всеми остальными проверками, кроме проверки FSM)
+    if is_admin(message.from_user.id):
+        # Но если мы уже в каком-то состоянии, не прерываем его
+        if current_state is None:
+            from handlers.admin_knowledge import detect_intent, start_admin_dialog
+            intent = await detect_intent(message.text)
+            if intent:
+                await start_admin_dialog(message, state, intent)
+                return
+        # Если состояние не None, админ-команды не обрабатываем (пусть идёт по обычной логике)
+
+    # ---- 2. Обработка состояний админ-диалогов ----
+    if current_state in ["AdminKnowledge:waiting_product_name", "AdminKnowledge:waiting_product_description", "AdminKnowledge:waiting_rule_text"]:
+        from handlers.admin_knowledge import process_product_name, process_product_description, process_rule_text
+        if current_state == "AdminKnowledge:waiting_product_name":
+            await process_product_name(message, state)
+        elif current_state == "AdminKnowledge:waiting_product_description":
+            await process_product_description(message, state)
+        elif current_state == "AdminKnowledge:waiting_rule_text":
+            await process_rule_text(message, state)
+        return
+
+    # ===== ОБРАБОТКА ВВОДА ПРОИЗВОЛЬНОГО ИСТОЧНИКА =====
+    if current_state == "CustomSource:waiting_source":
+        from main import custom_source_link_generate
+        await custom_source_link_generate(message, state)
+        return
+
+    # ===== ПРОВЕРКА ДЛЯ РЕГИСТРАЦИИ =====
     if current_state == Registration.is_partner:
         from handlers.menu import get_is_partner
         await get_is_partner(message, state)
+        return
+
+    if current_state == "ReplyState:waiting_user_reply":
+        from handlers.referrals import send_user_reply_main
+        await send_user_reply_main(message, state)
         return
 
     # Если пользователь в квизе и хочет выйти - завершаем квиз
@@ -1849,8 +2588,26 @@ async def handle_all_messages(message: Message, state: FSMContext):
             await show_product(message)
             return
     
-    # 5. Если ничего не подошло - ничего не делаем
-    print(f"🔵🔵🔵 Сообщение не обработано: {message.text}")
+    # 5. Если ничего не подошло — пробуем AI (если включён)
+    from handlers.ai_handler import handle_ai_request
+    from config import AI_ENABLED
+
+    if AI_ENABLED:
+        await handle_ai_request(message, state)
+    else:
+        # Старое поведение: показываем меню
+        user = get_user(message.from_user.id)
+        registered = user is not None
+        has_team = get_referrals_count(message.from_user.id) > 0 if registered else False
+        is_admin_user = is_admin(message.from_user.id)
+
+        await message.answer(
+            "🤔 Я не понял ваш запрос.\n\n"
+            "Пожалуйста, воспользуйтесь кнопками меню ниже, чтобы выбрать нужное действие:",
+            reply_markup=get_main_menu(registered, has_team, is_admin_user)
+        )
+        
+        print(f"🔵🔵🔵 Сообщение не обработано: {message.text}")
 
 
 @router.message(lambda m: m.text == "🤖 Перейти к консультации")
@@ -2088,13 +2845,110 @@ async def renumber_products(callback: CallbackQuery):
 @router.callback_query()
 async def redirect_callbacks(callback: CallbackQuery, state: FSMContext):
     print(f"🔹 ПОЛУЧЕН CALLBACK: {callback.data}")
+    
+    # ===== ГЕНЕРАТОР ПРИГЛАШЕНИЙ =====
+    if callback.data.startswith("invite_"):
+        from handlers.invite_generator import invite_type_selected, invite_source_selected
+        if callback.data.startswith("invite_source_"):
+            await invite_source_selected(callback, state)
+        else:
+            await invite_type_selected(callback, state)
+        return
+    
+    # ===== ДИАГНОСТИКА =====
+    if callback.data.startswith("diag_ans_") or callback.data in [
+        "diagnostics_restart", "diagnostics_compare", "diag_cancel",
+        "diag_recommendations", "diag_register", "diag_to_main",
+        "diag_consult", "diag_back_to_result"
+    ]:
+        from handlers.diagnostics import (
+            answer_question, restart_diagnostics, compare_diagnostics,
+            cancel_diagnostics, get_recommendations, register_after_diagnostic,
+            diag_to_main, diag_consult, back_to_result
+        )
+        if callback.data.startswith("diag_ans_"):
+            await answer_question(callback, state)
+        elif callback.data == "diagnostics_restart":
+            await restart_diagnostics(callback, state)
+        elif callback.data == "diagnostics_compare":
+            await compare_diagnostics(callback)
+        elif callback.data == "diag_cancel":
+            await cancel_diagnostics(callback, state)
+        elif callback.data == "diag_recommendations":
+            await get_recommendations(callback)
+        elif callback.data == "diag_register":
+            await register_after_diagnostic(callback, state)
+        elif callback.data == "diag_to_main":
+            await diag_to_main(callback)
+        elif callback.data == "diag_consult":
+            await diag_consult(callback)
+        elif callback.data == "diag_back_to_result":
+            await back_to_result(callback)
+        elif callback.data == "diag_register_recommend":
+            from handlers.diagnostics import register_from_recommend
+            await register_from_recommend(callback, state)    
+        return
+    
+        # ===== АКЦИИ (ADMIN) =====
+    if callback.data == "admin_add_promo":
+        await admin_add_promo_start(callback, state)
+        return
 
+    if callback.data.startswith("admin_edit_promo_"):
+        await admin_edit_promo(callback, state)
+        return
+
+    if callback.data == "promo_edit_title":
+        await promo_edit_title(callback, state)
+        return
+
+    if callback.data == "promo_edit_desc":
+        await promo_edit_desc(callback, state)
+        return
+
+    if callback.data == "promo_edit_photo":
+        await promo_edit_photo(callback, state)
+        return
+
+    if callback.data == "promo_edit_link":
+        await promo_edit_link(callback, state)
+        return
+
+    if callback.data == "promo_edit_expires":
+        await promo_edit_expires(callback, state)
+        return
+
+    if callback.data.startswith("promo_toggle_"):
+        await promo_toggle(callback)
+        return
+
+    if callback.data.startswith("promo_delete_"):
+        await promo_delete(callback, state)
+        return
+
+    if callback.data.startswith("promo_confirm_delete_"):
+        await promo_confirm_delete(callback)
+        return
+
+    if callback.data == "admin_back_to_promos":
+        await admin_back_to_promos(callback)
+        return
+
+    if callback.data == "admin_back_to_admin":
+        await admin_back_to_admin(callback)
+        return
+    
     # Квиз
     if callback.data.startswith("quiz_"):
         from handlers.quiz import answer_question
         await answer_question(callback, state)
         return
-
+        # ===== ПОКАЗ НЕЗАРЕГИСТРИРОВАННЫХ В ДЕРЕВЕ =====
+    if callback.data.startswith("show_unreg_"):
+        from handlers.admin import show_unregistered_list
+        await show_unregistered_list(callback, state)
+        return
+    
     # Симптомы (подбор по показаниям)
     if callback.data.startswith("symptom_select_"):
         from handlers.products import show_products_by_symptom
@@ -2142,7 +2996,7 @@ async def redirect_callbacks(callback: CallbackQuery, state: FSMContext):
     elif callback.data.startswith("consult_"):
         from handlers.products import product_consultation
         await product_consultation(callback)
-       
+        
     elif callback.data == "how_to_order":
         from handlers.products import how_to_order
         await how_to_order(callback)
@@ -2266,40 +3120,4 @@ async def redirect_callbacks(callback: CallbackQuery, state: FSMContext):
 
     elif callback.data.startswith("show_tree_"):
         from handlers.admin import show_partner_tree
-        await show_partner_tree(callback)     
-
-    elif callback.data.startswith("invite_"):
-        from handlers.invite_generator import generate_invite
-        await generate_invite(callback)    
-
-    elif callback.data == "copy_text":
-        from handlers.invite_generator import copy_text
-        await copy_text(callback)
-
-    elif callback.data == "back_to_invite_generator":
-        from handlers.invite_generator import back_to_invite_generator
-        await back_to_invite_generator(callback)
-
-    elif callback.data == "back_to_team_menu":
-        from handlers.invite_generator import back_to_team_menu
-        await back_to_team_menu(callback)
-
-    elif callback.data.startswith("order_status_"):
-        from handlers.orders import update_order_status_from_list
-        await update_order_status_from_list(callback)   
-
-    elif callback.data.startswith("admin_reply_complaint_"):
-        parts = callback.data.split("_")
-        consult_id = int(parts[3])
-        user_id = int(parts[4])
-        
-        await state.update_data(
-            reply_complaint_consult_id=consult_id,
-            reply_complaint_user_id=user_id
-        )
-        await state.set_state("admin_waiting_complaint_reply")
-        
-        await callback.message.answer("✏️ Введите ответ для пользователя (по жалобе):")
-        await callback.answer()       
-
-   
+        await show_partner_tree(callback, state)

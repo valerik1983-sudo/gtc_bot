@@ -696,45 +696,137 @@ async def admin_send_complaint_reply(message: Message, state: FSMContext):
 async def all_partners(message: Message):
     if not is_admin(message.from_user.id):
         return
-    
-    from database import get_all_partners, get_full_referral_tree, format_referral_tree
-    
+
+    from database import get_all_partners, get_diagnostic_history
+
     partners = get_all_partners()
-    
+    print(f"🔍 Найдено партнёров (админ): {len(partners)}")
+
     if not partners:
         await message.answer("Нет партнёров в системе")
         return
-    
-    # Формируем список партнёров для выбора
-    keyboard = []
+
+    # Разделяем на две группы
+    partners_with_diag = []
+    partners_without_diag = []
+
     for partner in partners:
+        history = get_diagnostic_history(partner['telegram_id'])
+        
+        print(f"🔍 Партнёр {partner['fio']} (ID {partner['telegram_id']}) — диагностика: {len(history)} записей")
+        if len(history) > 0:
+            partners_with_diag.append(partner)
+        else:
+            partners_without_diag.append(partner)
+
+    # Формируем клавиатуру: сначала с диагностикой, потом без
+    keyboard = []
+
+    for partner in partners_with_diag:
+        display_text = f"🧬 {partner['fio']} (ID: {partner['telegram_id']})"
         keyboard.append([InlineKeyboardButton(
-            text=f"{partner['fio']} (ID: {partner['telegram_id']})",
+            text=display_text,
             callback_data=f"show_tree_{partner['telegram_id']}"
         )])
-    
+
+    for partner in partners_without_diag:
+        display_text = f"{partner['fio']} (ID: {partner['telegram_id']})"
+        keyboard.append([InlineKeyboardButton(
+            text=display_text,
+            callback_data=f"show_tree_{partner['telegram_id']}"
+        )])
+
     await message.answer(
-        "🌳 **Выберите партнёра для просмотра реферального дерева:**",
+        "🌳 **Выберите партнёра для просмотра реферального дерева:**\n\n"
+        ,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         parse_mode="Markdown"
     )
 
 
 @router.callback_query(lambda c: c.data.startswith("show_tree_"))
-async def show_partner_tree(callback: CallbackQuery):
+async def show_partner_tree(callback: CallbackQuery, state: FSMContext):
     partner_id = int(callback.data.split("_")[2])
     
-    from database import get_user, get_full_referral_tree, format_referral_tree, get_status_style
-    
+    from database import get_user, get_full_referral_tree, get_status_style, get_connection
+
     partner = get_user(partner_id)
     if not partner:
         await callback.message.answer("❌ Партнёр не найден")
         await callback.answer()
         return
-    
+
     tree = get_full_referral_tree(partner_id, level=1, max_level=5)
+
+    # ---- Рекурсивно извлекаем незарегистрированных ----
+    unregistered_nodes = []
     
-    # Легенда статусов
+    def extract_unregistered(nodes):
+        for node in nodes:
+            if not node.get('registered', True):
+                unregistered_nodes.append(node)
+            if node.get('children'):
+                extract_unregistered(node['children'])
+    
+    extract_unregistered(tree)
+
+    # ---- Фильтруем дерево, оставляя только зарегистрированных ----
+    def filter_registered(nodes):
+        filtered = []
+        for node in nodes:
+            if node.get('registered', True):
+                new_node = node.copy()
+                if node.get('children'):
+                    new_node['children'] = filter_registered(node['children'])
+                filtered.append(new_node)
+        return filtered
+    
+    filtered_tree = filter_registered(tree)
+
+    # 🔧 ВРУЧНУЮ добавляем информацию о диагностике для каждого узла (для отфильтрованного дерева)
+    def enrich_with_diagnostic(nodes):
+        conn = get_connection()
+        cursor = conn.cursor()
+        for node in nodes:
+            cursor.execute("SELECT COUNT(*) FROM diagnostic_results WHERE user_id = ?", (node["id"],))
+            count = cursor.fetchone()[0]
+            node["has_diagnostic"] = count > 0
+            if node.get("children"):
+                enrich_with_diagnostic(node["children"])
+        conn.close()
+
+    if filtered_tree:
+        enrich_with_diagnostic(filtered_tree)
+
+    # Функция форматирования дерева
+    def format_tree(nodes, prefix="", is_last=True):
+        text = ""
+        for i, node in enumerate(nodes):
+            is_last_child = (i == len(nodes) - 1)
+            if prefix:
+                text += prefix + ("└── " if is_last_child else "├── ")
+            else:
+                text += "└── " if is_last_child else "├── "
+
+            diag_icon = "🧬 " if node.get("has_diagnostic", False) else ""
+
+            if not node.get("registered", True):
+                text += f"{diag_icon}⏳ **{node['fio']}**\n"
+                text += prefix + ("    " if is_last_child else "│   ") + f"   🆔 {node['id']}\n"
+                text += prefix + ("    " if is_last_child else "│   ") + "   ⚠️ *Ожидает регистрации*\n"
+            else:
+                style = get_status_style(node["status"])
+                text += f"{diag_icon}{style['emoji']} **{node['fio']}**\n"
+                text += prefix + ("    " if is_last_child else "│   ") + f"   🆔 {node['id']}\n"
+                if node.get("phone"):
+                    text += prefix + ("    " if is_last_child else "│   ") + f"   📞 {node['phone']}\n"
+
+            if node.get("children"):
+                new_prefix = prefix + ("    " if is_last_child else "│   ")
+                text += format_tree(node["children"], new_prefix, is_last_child)
+        return text
+
+    # Легенда
     legend = (
         "📊 **Легенда статусов:**\n"
         "🆕 - Новый (зарегистрировался)\n"
@@ -742,33 +834,84 @@ async def show_partner_tree(callback: CallbackQuery):
         "🟢 - Клиент\n"
         "💎 - Партнёр\n"
         "🔴 - Не отвечает\n"
-        "⏳ - Ожидает регистрации (перешёл по ссылке)\n\n"  # 👈 ДОБАВЛЯЕМ
+        "⏳ - Ожидает регистрации (перешёл по ссылке)\n"
+        "🧬 - Прошёл диагностику\n\n"
     )
-    
-    if not tree:
+
+    if not filtered_tree and not unregistered_nodes:
         await callback.message.answer(
             legend + f"👤 **{partner['fio']}** (ID: {partner_id})\n\nНет приглашённых пользователей.",
             parse_mode="Markdown"
         )
         await callback.answer()
         return
-    
+
     text = legend + f"🌳 **Реферальное дерево**\n\n"
     text += f"👑 **{partner['fio']}** (ID: {partner_id})\n\n"
-    text += format_referral_tree(tree, "", False)
-    
-    # Разбиваем на части, если текст слишком длинный
+
+    if filtered_tree:
+        text += format_tree(filtered_tree, "", False)
+    else:
+        text += "Нет зарегистрированных приглашённых.\n"
+
+    # Сохраняем список незарегистрированных в state
+    await state.update_data(unregistered_list=unregistered_nodes)
+
+    # Если есть незарегистрированные, добавляем счётчик и кнопку
+    if unregistered_nodes:
+        text += f"\n\n📌 **Незарегистрированных: {len(unregistered_nodes)}**"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="👤 Показать незарегистрированных", callback_data=f"show_unreg_{partner_id}")]
+        ])
+    else:
+        keyboard = None
+
     if len(text) > 4000:
         parts = [text[i:i+4000] for i in range(0, len(text), 4000)]
         for i, part in enumerate(parts):
             if i == 0:
-                await callback.message.edit_text(part, parse_mode="Markdown")
+                await callback.message.edit_text(part, reply_markup=keyboard, parse_mode="Markdown")
             else:
                 await callback.message.answer(part, parse_mode="Markdown")
     else:
-        await callback.message.edit_text(text, parse_mode="Markdown")
-    
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+
     await callback.answer()
+    
+@router.callback_query(lambda c: c.data.startswith("show_unreg_"))
+async def show_unregistered_list(callback: CallbackQuery, state: FSMContext):
+    partner_id = int(callback.data.split("_")[2])
+    
+    # Заново получаем дерево для этого партнёра
+    from database import get_full_referral_tree
+    tree = get_full_referral_tree(partner_id, level=1, max_level=5)
+    
+    # Рекурсивно извлекаем незарегистрированных
+    unregistered = []
+    def extract_unregistered(nodes):
+        for node in nodes:
+            if not node.get('registered', True):
+                unregistered.append(node)
+            if node.get('children'):
+                extract_unregistered(node['children'])
+    extract_unregistered(tree)
+    
+    if not unregistered:
+        await callback.message.answer("Нет незарегистрированных пользователей.")
+        await callback.answer()
+        return
+    
+    text = f"📋 **Незарегистрированные (приглашённые пользователем {partner_id})**\n\n"
+    for i, node in enumerate(unregistered, 1):
+        text += f"{i}. 🆔 {node['id']} (перешёл по ссылке, но не зарегистрировался)\n"
+    text += f"\nВсего: {len(unregistered)} человек."
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Назад к дереву", callback_data=f"show_tree_{partner_id}")]
+    ])
+    
+    await callback.message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    await callback.answer()  
 
 @router.callback_query(F.data == "admin_reorder_products")
 async def admin_reorder_products(callback: CallbackQuery):

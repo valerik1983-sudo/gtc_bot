@@ -19,6 +19,7 @@ class EditProduct(StatesGroup):
     waiting_for_photo = State()
     waiting_for_story_key = State()
     waiting_for_program_key = State()
+    waiting_for_video = State()
 
 
 '''@router.message(F.text == "🛍 Управление товарами")
@@ -96,6 +97,7 @@ async def edit_product_form(callback: CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="📄 Изменить описание", callback_data="edit_desc")],
         [InlineKeyboardButton(text="💰 Изменить цену", callback_data="edit_price")],
         [InlineKeyboardButton(text="🖼 Изменить фото", callback_data="edit_photo")],
+        [InlineKeyboardButton(text="🎬 Добавить видео", callback_data="admin_edit_video")],
         [InlineKeyboardButton(text="🔑 Изменить ключ истории", callback_data="edit_story")],
         [InlineKeyboardButton(text="🎁 Изменить ключ программы", callback_data="edit_program")],
         [InlineKeyboardButton(text="🗑 Удалить товар", callback_data="delete_product")],
@@ -199,4 +201,60 @@ async def back_to_admin(callback: CallbackQuery):
         reply_markup=admin_menu
     )
     await callback.answer()
+    
+@router.callback_query(F.data == "admin_edit_video")
+async def admin_edit_video_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(EditProduct.waiting_for_video)
+    await callback.message.answer(
+        "🎬 Введите ссылку на видео (YouTube, Vimeo или любой другой хостинг):\n\n"
+        "Пример: https://www.youtube.com/watch?v=XXXXX"
+    )
+    await callback.answer()
+
+
+@router.message(EditProduct.waiting_for_video)
+async def admin_edit_video_save(message: Message, state: FSMContext):
+    video_url = message.text.strip()
+    if not video_url.startswith(('http://', 'https://')):
+        await message.answer("❌ Введите корректную ссылку (начинается с http:// или https://):")
+        return
+
+    data = await state.get_data()
+    product_id = data.get("editing_product_id")
+    if not product_id:
+        await message.answer("❌ Ошибка: товар не найден")
+        await state.clear()
+        return
+
+    from database import update_product_in_db, get_product_by_id, get_product_price
+    update_product_in_db(product_id, video_url=video_url)
+
+    await message.answer("✅ Видео сохранено!")
+
+    # Возвращаемся к форме редактирования
+    product = get_product_by_id(product_id)
+    if product:
+        price = get_product_price(product['name'])
+        price_display = f"{price} руб." if price and price > 0 else "не указана"
+
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📝 Изменить название", callback_data="admin_edit_name")],
+            [InlineKeyboardButton(text="📄 Изменить описание", callback_data="admin_edit_desc")],
+            [InlineKeyboardButton(text="💰 Изменить цену", callback_data="admin_edit_price")],
+            [InlineKeyboardButton(text="🖼 Изменить фото", callback_data="admin_edit_photo")],
+            [InlineKeyboardButton(text="🎬 Добавить видео", callback_data="admin_edit_video")],
+            [InlineKeyboardButton(text="🗑 Удалить товар", callback_data="admin_delete_product")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="admin_list_products")]
+        ])
+
+        text = f"**{product['name']}**\n\n"
+        text += f"📄 {product['description'][:100]}...\n" if product['description'] else ""
+        text += f"💰 {price_display}\n"
+        text += f"🎬 Видео: {'есть' if product.get('video_url') else 'нет'}\n"
+
+        await message.answer(text, reply_markup=keyboard, parse_mode="Markdown")
+    else:
+        await message.answer("❌ Товар не найден")
+
+    await state.clear()    
   

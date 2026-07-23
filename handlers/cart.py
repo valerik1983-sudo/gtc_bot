@@ -4,6 +4,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.filters import StateFilter 
 from datetime import datetime
 from database import get_office_cities
+from database import get_gift_claim, redeem_gift_claim
 import re
 
 from database import (
@@ -390,6 +391,19 @@ async def final_confirm_order(callback: CallbackQuery, state: FSMContext, bot: B
         items=data["items"]
     )
     
+    # Проверяем подарок
+    gift_claim = get_gift_claim(user_id)
+    if gift_claim:
+        # Отмечаем подарок как использованный
+        redeem_gift_claim(user_id)
+        # Добавляем пометку в заказ (можно сохранить в БД, если нужно)
+        # Например, если есть поле gift_applied в orders, обновить:
+        # cursor.execute("UPDATE orders SET gift_applied = 1 WHERE id = ?", (order_id,))
+        # Добавляем информацию в order_text для наставника
+        gift_marker = "\n\n🎁 **Подарок за диагностику активирован!**"
+    else:
+        gift_marker = ""
+    
     user = get_user(user_id)
     sponsor_id = user.get("sponsor_id") if user else None
     
@@ -403,6 +417,7 @@ async def final_confirm_order(callback: CallbackQuery, state: FSMContext, bot: B
         f"**Получение:** {'Самовывоз' if data['delivery_method'] == 'pickup' else 'СДЭК'}\n"
         f"**ПВЗ:** {data['pickup_point']}\n\n"
         f"**Заказ:**\n{items_text}"
+        f"{gift_marker}"
     )
     
     # Отправляем уведомление наставнику
